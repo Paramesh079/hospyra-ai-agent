@@ -34,14 +34,19 @@ def parse_sql_from_output(output: str):
         return output[start_idx:end_idx].strip()
     return output.strip()
 
-def query_menu(user_prompt: str):
+def query_menu(user_prompt: str, hotel_id: int):
     """
     Converts user prompt into SQL query and executes it against PostgreSQL
     """
-    print(f"\n[LOG] query_menu() called with prompt: {user_prompt}")
+    print(f"\n[LOG] query_menu() called with prompt: {user_prompt}, hotel_id: {hotel_id}")
     
-    system_prompt = """
+    system_prompt = f"""
                   You are a PostgreSQL Query Generator for a restaurant ordering system.
+
+                  CRITICAL REQUIREMENT:
+                  You MUST filter the queries for the current restaurant (ID: {hotel_id}). 
+                  When querying `menu_items`, you MUST join with `menu_categories mc` and `menus mn` and include: `mn.hotel_id = {hotel_id}`
+                  When querying `orders`, you MUST include: `orders.hotel_id = {hotel_id}`
 
                   DATABASE SCHEMA:
                   Table: menu_items
@@ -59,11 +64,17 @@ def query_menu(user_prompt: str):
 
                   Table: menu_categories
                   - id (INTEGER PRIMARY KEY)
+                  - menu_id (INTEGER) - Foreign Key to menus.id
                   - name (VARCHAR) - Category name (e.g., 'Starters', 'Main Course')
                   - priority (INTEGER)
                   - is_active (BOOLEAN)
                   - created_at (TIMESTAMP)
                   - updated_at (TIMESTAMP)
+
+                  Table: menus
+                  - id (INTEGER PRIMARY KEY)
+                  - hotel_id (INTEGER) - Must exactly match {hotel_id}
+                  - name (VARCHAR)
 
                   Table: orders
                   - id (INTEGER PRIMARY KEY)
@@ -108,13 +119,14 @@ def query_menu(user_prompt: str):
                         FROM order_items oi
                         JOIN orders o ON oi.order_id = o.id
                         JOIN menu_items mi ON oi.menu_item_id = mi.id
-                        WHERE o.user_id = 21
+                        WHERE o.user_id = 21 AND o.hotel_id = {hotel_id}
                     )
                     SELECT mi.name, mc.name as category, mi.price
                     FROM menu_items mi
                     JOIN menu_categories mc ON mi.category_id = mc.id
+                    JOIN menus mn ON mc.menu_id = mn.id
                     JOIN user_history uh ON mi.is_vegetarian = uh.is_vegetarian
-                    WHERE mi.is_available = true
+                    WHERE mi.is_available = true AND mn.hotel_id = {hotel_id}
                     GROUP BY mi.name, mc.name, mi.price, mi.id
                     ORDER BY 
                       MAX(CASE WHEN mi.id IN (SELECT id FROM user_history) THEN 1 ELSE 0 END) DESC, -- LAYER 1
@@ -129,12 +141,13 @@ def query_menu(user_prompt: str):
 
                   - Query for Global Name Matches (Layer 2 focus):
                     ```sql
-                    WITH history AS (SELECT DISTINCT name, is_vegetarian FROM menu_items WHERE id IN (SELECT menu_item_id FROM order_items oi JOIN orders o ON oi.order_id = o.id WHERE o.user_id = 7))
+                    WITH history AS (SELECT DISTINCT name, is_vegetarian FROM menu_items WHERE id IN (SELECT menu_item_id FROM order_items oi JOIN orders o ON oi.order_id = o.id WHERE o.user_id = 7 AND o.hotel_id = {hotel_id}))
                     SELECT mi.name, mc.name as category, mi.price
                     FROM menu_items mi
                     JOIN menu_categories mc ON mi.category_id = mc.id
+                    JOIN menus mn ON mc.menu_id = mn.id
                     JOIN history h ON mi.is_vegetarian = h.is_vegetarian
-                    WHERE mi.name ILIKE '%' || h.name || '%' OR h.name ILIKE '%' || mi.name || '%'
+                    WHERE (mi.name ILIKE '%' || h.name || '%' OR h.name ILIKE '%' || mi.name || '%') AND mn.hotel_id = {hotel_id}
                     GROUP BY mi.name, mc.name, mi.price, mi.id
                     ORDER BY mi.name
                     LIMIT 100;
@@ -156,7 +169,8 @@ def query_menu(user_prompt: str):
                   SELECT mi.name, mc.name as category, mi.price 
                   FROM menu_items mi 
                   JOIN menu_categories mc ON mi.category_id = mc.id
-                  WHERE mi.name ILIKE '%cheese%' AND mi.name ILIKE '%pizza%'
+                  JOIN menus mn ON mc.menu_id = mn.id
+                  WHERE mi.name ILIKE '%cheese%' AND mi.name ILIKE '%pizza%' AND mn.hotel_id = {hotel_id}
                   LIMIT 30;
                   ```"""
                 
@@ -189,17 +203,18 @@ def query_menu(user_prompt: str):
         return {"error": "Internal Server Error", "details": str(e)}
 
 
-def get_user_order_history(user_id: str):
+def get_user_order_history(user_id: str, hotel_id: int):
     """
     Retrieves all items previously ordered by a specific user from the database.
     
     Args:
         user_id: The user ID to retrieve order history for
+        hotel_id: The restaurant ID to filter on
     
     Returns:
         List of item names the user has previously ordered
     """
-    print(f"[LOG] Retrieving order history for user: {user_id}")
+    print(f"[LOG] Retrieving order history for user: {user_id} and hotel: {hotel_id}")
     
     try:
         query = """
@@ -207,12 +222,12 @@ def get_user_order_history(user_id: str):
         FROM order_items oi
         JOIN orders o ON oi.order_id = o.id
         JOIN menu_items mi ON oi.menu_item_id = mi.id
-        WHERE o.user_id = :user_id
+        WHERE o.user_id = :user_id AND o.hotel_id = :hotel_id
         ORDER BY mi.name
         """
         
         with engine.connect() as connection:
-            result = connection.execute(text(query), {"user_id": int(user_id)})
+            result = connection.execute(text(query), {"user_id": int(user_id), "hotel_id": hotel_id})
             order_history = [row[0].strip() for row in result.fetchall()]
         
         print(f"[LOG] Found {len(order_history)} distinct items in user's order history")
@@ -228,7 +243,7 @@ def get_user_order_history(user_id: str):
         return []
 
 
-def semantic_search_similar_items(user_prompt: str, similarity_threshold: float = 0.4):
+def semantic_search_similar_items(user_prompt: str, hotel_id: int, similarity_threshold: float = 0.4):
     """
     Performs semantic search on query_menu results against user's order history.
     Retrieves all items the user has previously ordered and compares them with query_menu results.
@@ -245,14 +260,14 @@ def semantic_search_similar_items(user_prompt: str, similarity_threshold: float 
     
     try:
         # Get user's order history (all items they've previously ordered)
-        user_order_history = get_user_order_history(user_prompt)
+        user_order_history = get_user_order_history(user_prompt, hotel_id)
         
         if not user_order_history:
             print("[LOG] No order history found for this user")
             return []
         
         # Get recommendations from query_menu
-        results = query_menu(user_prompt)
+        results = query_menu(user_prompt, hotel_id)
         
         if not results or isinstance(results, dict) and "error" in results:
             print("[LOG] No results from query_menu or error occurred")

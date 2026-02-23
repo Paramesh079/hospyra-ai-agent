@@ -23,7 +23,7 @@ llm = AzureChatOpenAI(
 )
 
 
-async def analyze_reviews_with_agent(limit: int = 20):
+async def analyze_reviews_with_agent(hotel_id: int, limit: int = 20):
     """
     LLM-based review analysis (Streaming).
     Flow:
@@ -42,11 +42,11 @@ async def analyze_reviews_with_agent(limit: int = 20):
             review_query = text("""
                 SELECT id, comment
                 FROM reviews
-                WHERE comment IS NOT NULL
+                WHERE comment IS NOT NULL AND hotel_id = :hotel_id
                 ORDER BY id DESC
                 LIMIT 200
             """)
-            review_results = connection.execute(review_query).fetchall()
+            review_results = connection.execute(review_query, {"hotel_id": hotel_id}).fetchall()
 
         if not review_results:
             return
@@ -93,8 +93,10 @@ Return ONLY valid JSON:
                     m.price AS item_price
                 FROM menu_items m
                 LEFT JOIN menu_categories c ON m.category_id = c.id
+                LEFT JOIN menus mn ON c.menu_id = mn.id
+                WHERE mn.hotel_id = :hotel_id
             """)
-            menu_items = connection.execute(menu_query).fetchall()
+            menu_items = connection.execute(menu_query, {"hotel_id": hotel_id}).fetchall()
 
         fetch_end_time = time.time()
         print(f"[TIME] Data Fetching Time: {fetch_end_time - fetch_start_time:.2f} seconds")
@@ -103,6 +105,7 @@ Return ONLY valid JSON:
         processing_start_time = time.time()
         tasks = [llm.ainvoke(prompt) for prompt in prompts]
         completed_count = 0
+        all_valid_dishes = []
         
         for task in asyncio.as_completed(tasks):
             try:
@@ -142,6 +145,7 @@ Return ONLY valid JSON:
                     
                     if best_match:
                         valid_dishes.append({
+                            "id": best_match[0],
                             "dish_name": best_match[1],
                             "category": best_match[2],
                             "price": float(best_match[3]) if isinstance(best_match[3], Decimal) else best_match[3],
@@ -151,24 +155,23 @@ Return ONLY valid JSON:
                         })
                 
                 if valid_dishes:
-                    # Sort dishes from this chunk
-                    valid_dishes.sort(key=lambda x: (x["sentiment_score"], x["positive_mentions"]), reverse=True)
-                    # Limit dishes from chunk if needed (e.g. up to 'limit' per chunk to avoid massive payload)
-                    limited_dishes = valid_dishes[:limit]
-                    
-                    # Yield results in chunks of 4 at a time
-                    response_start_time = time.time()
-                    for i in range(0, len(limited_dishes), 4):
-                        chunk = limited_dishes[i:i + 4]
-                        yield f"data: {json.dumps(chunk)}\n\n"
-                        await asyncio.sleep(0.05)
-                    response_end_time = time.time()
-                    print(f"[TIME] Response Streaming Time (Chunk): {response_end_time - response_start_time:.2f} seconds")
+                    # Append items to the master list
+                    for dish in valid_dishes:
+                        if dish["id"] not in [d["id"] for d in all_valid_dishes]:
+                            all_valid_dishes.append(dish)
             
             except Exception as e:
                 import traceback
                 traceback.print_exc()
 
+        # Sort combined dishes at the end
+        if all_valid_dishes:
+            all_valid_dishes.sort(key=lambda x: (x.get("sentiment_score", 0), x.get("positive_mentions", 0)), reverse=True)
+            limited_dishes = all_valid_dishes[:limit]
+            
+            formatted_chunk = [{"id": item["id"]} for item in limited_dishes]
+            yield f"data: {json.dumps(formatted_chunk)}\n\n"
+            
         processing_end_time = time.time()
         print(f"[TIME] Total Data Processing & LLM Time: {processing_end_time - processing_start_time:.2f} seconds")
         print(f"[TIME] Total Execution Time: {time.time() - total_start_time:.2f} seconds")
@@ -176,4 +179,4 @@ Return ONLY valid JSON:
     except Exception as e:
         import traceback
         traceback.print_exc()
-        yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+        yield f"{json.dumps({'type': 'error', 'message': str(e)})}\n\n"

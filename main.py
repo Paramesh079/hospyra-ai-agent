@@ -6,20 +6,21 @@ from review_analyzer import analyze_reviews_with_agent
 app = FastAPI(name="hospyra", version="1.0.0", title="ai_menu_recommender", description="AI Menu Recommender for Hospyra")
 
 @app.get("/user-preferences",tags=["ai-menu"])
-async def run_query(prompt: str):
+async def run_query(user_id: int, hotel_id: int):
     return {
-        "prompt": prompt,
-        "result": semantic_search_similar_items(prompt)
+        "user_id": user_id,
+        "hotel_id": hotel_id,
+        "result": semantic_search_similar_items(str(user_id), hotel_id)
     }
     
 @app.get("/reviews-recommendations", tags=["ai-menu"])
-async def get_agent_recommendations(limit: int = 20):
+async def get_agent_recommendations(hotel_id: int, limit: int = 20):
     """
     LLM-Based Positive Dish Recommendation (Streaming)
     """
     # Return a StreamingResponse using Server-Sent Events (SSE)
     return StreamingResponse(
-        analyze_reviews_with_agent(limit=limit),
+        analyze_reviews_with_agent(hotel_id=hotel_id, limit=limit),
         media_type="text/event-stream"
     )
 
