@@ -1,5 +1,8 @@
+from decimal import Decimal
+import asyncio
 import re
 import json
+import time
 from sqlalchemy import text
 from db import engine
 from langchain_openai import AzureChatOpenAI
@@ -22,184 +25,155 @@ llm = AzureChatOpenAI(
 
 async def analyze_reviews_with_agent(limit: int = 20):
     """
-    LLM-based review analysis.
+    LLM-based review analysis (Streaming).
     Flow:
-    1. Load reviews from PostgreSQL
-    2. LLM extracts dishes + sentiment
+    1. Load reviews from PostgreSQL (Limit to 200)
+    2. LLM extracts dishes + sentiment (Parallel execution, streaming as completed)
     3. Validate dish names against menu table
-    4. Keep only positive dishes
-    5. Sort by strongest positivity
-    6. Return top N
+    4. Yield valid positive dishes as Server-Sent Events (SSE)
     """
 
     try:
-        # 1️⃣ Load reviews from PostgreSQL
+        total_start_time = time.time()
+        
+        # 1️⃣ Load a limited number of reviews
+        fetch_start_time = time.time()
         with engine.connect() as connection:
             review_query = text("""
                 SELECT id, comment
                 FROM reviews
                 WHERE comment IS NOT NULL
+                ORDER BY id DESC
+                LIMIT 200
             """)
             review_results = connection.execute(review_query).fetchall()
 
         if not review_results:
-            return {"error": "No reviews found"}
+            return
 
-        # Chunk reviews to avoid context limits (e.g., 20 at a time)
-        chunk_size = 20
-        extracted_dishes = {}
+        chunk_size = 4
+        total_chunks = (len(review_results) + chunk_size - 1) // chunk_size
+        
+        system_prompt = """
+You are a Restaurant Review Analysis Agent.
 
+Task:
+1. Identify ALL dishes mentioned.
+2. Determine sentiment for EACH dish.
+3. Count positive and negative mentions.
+
+Return ONLY valid JSON:
+
+{
+  "dishes": [
+    {
+      "name": "Dish Name",
+      "positive_mentions": 2,
+      "negative_mentions": 0,
+      "sentiment_score": 0.85
+    }
+  ]
+}
+"""
+        prompts = []
         for i in range(0, len(review_results), chunk_size):
             chunk = review_results[i:i + chunk_size]
-            reviews_text = "\n\n".join([
-                f"Review #{row[0]}:\n{row[1]}"
-                for row in chunk
-            ])
-            print(f"DEBUG: Processing chunk {i//chunk_size + 1} ({len(chunk)} reviews)...")
-
-            # 2️⃣ LLM Prompt
-            system_prompt = """
-    You are a Restaurant Review Analysis Agent.
-
-    Task:
-    1. Identify ALL dishes mentioned.
-    2. Determine sentiment for EACH dish.
-    3. Count positive and negative mentions.
-
-    Return ONLY valid JSON:
-
-    {
-      "dishes": [
-        {
-          "name": "Dish Name",
-          "positive_mentions": 2,
-          "negative_mentions": 0,
-          "sentiment_score": 0.85
-        }
-      ]
-    }
-    """
-
+            reviews_text = "\n\n".join([f"Review #{row[0]}:\n{row[1]}" for row in chunk])
             final_prompt = system_prompt + "\n\nREVIEWS:\n\n" + reviews_text
-            print(f"DEBUG: Connecting to LLM ({deployment_name}) for chunk {i//chunk_size + 1}...")
-            response = llm.invoke(final_prompt)
-            print(f"DEBUG: Raw LLM response received for chunk {i//chunk_size + 1}:")
-            print(response.content)
+            prompts.append(final_prompt)
 
-            json_match = re.search(r'\{[\s\S]*\}', response.content)
-            if not json_match:
-                print(f"DEBUG: Invalid LLM response for chunk {i//chunk_size + 1}. Skipping.")
-                continue
+        # Pre-load menu items for fast in-memory validation
+        menu_items = []
+        with engine.connect() as connection:
+            menu_query = text("""
+                SELECT 
+                    m.id,
+                    m.name AS item_name,
+                    c.name AS item_category,
+                    m.price AS item_price
+                FROM menu_items m
+                LEFT JOIN menu_categories c ON m.category_id = c.id
+            """)
+            menu_items = connection.execute(menu_query).fetchall()
 
+        fetch_end_time = time.time()
+        print(f"[TIME] Data Fetching Time: {fetch_end_time - fetch_start_time:.2f} seconds")
+
+        # 2️⃣ Execute LLM calls and yield as they complete
+        processing_start_time = time.time()
+        tasks = [llm.ainvoke(prompt) for prompt in prompts]
+        completed_count = 0
+        
+        for task in asyncio.as_completed(tasks):
             try:
+                response = await task
+                completed_count += 1
+                
+                json_match = re.search(r'\{[\s\S]*\}', response.content)
+                if not json_match:
+                    continue
+
                 agent_analysis = json.loads(json_match.group())
                 chunk_dishes = agent_analysis.get("dishes", [])
                 
-                # Aggregate results
+                valid_dishes = []
                 for dish in chunk_dishes:
-                    name = dish.get("name", "").lower()
-                    if not name:
+                    if dish.get("sentiment_score", 0) <= 0 or dish.get("positive_mentions", 0) <= dish.get("negative_mentions", 0):
+                        continue # Skip non-positive right away
+                        
+                    dish_name_lower = dish["name"].lower()
+                    if not dish_name_lower:
                         continue
-                    if name in extracted_dishes:
-                        extracted_dishes[name]["positive_mentions"] += dish.get("positive_mentions", 0)
-                        extracted_dishes[name]["negative_mentions"] += dish.get("negative_mentions", 0)
-                        # Very simple weighted average for sentiment mapping across chunks
-                        old_weight = extracted_dishes[name]["positive_mentions"] + extracted_dishes[name]["negative_mentions"]
-                        new_weight = dish.get("positive_mentions", 0) + dish.get("negative_mentions", 0)
-                        if old_weight + new_weight > 0:
-                            extracted_dishes[name]["sentiment_score"] = (
-                                (extracted_dishes[name]["sentiment_score"] * old_weight) + 
-                                (dish.get("sentiment_score", 0) * new_weight)
-                            ) / (old_weight + new_weight)
-                    else:
-                        extracted_dishes[name] = dish
+                        
+                    name_words = dish_name_lower.split()
+                    
+                    # Simple in-memory matching
+                    best_match = None
+                    for item in menu_items:
+                        item_name_lower = str(item[1]).lower()
+                        if len(name_words) == 1:
+                            if name_words[0] in item_name_lower:
+                                best_match = item
+                                break
+                        else:
+                            if name_words[0] in item_name_lower and name_words[-1] in item_name_lower:
+                                best_match = item
+                                break
+                    
+                    if best_match:
+                        valid_dishes.append({
+                            "dish_name": best_match[1],
+                            "category": best_match[2],
+                            "price": float(best_match[3]) if isinstance(best_match[3], Decimal) else best_match[3],
+                            "sentiment_score": dish.get("sentiment_score", 0),
+                            "positive_mentions": dish.get("positive_mentions", 0),
+                            "negative_mentions": dish.get("negative_mentions", 0)
+                        })
+                
+                if valid_dishes:
+                    # Sort dishes from this chunk
+                    valid_dishes.sort(key=lambda x: (x["sentiment_score"], x["positive_mentions"]), reverse=True)
+                    # Limit dishes from chunk if needed (e.g. up to 'limit' per chunk to avoid massive payload)
+                    limited_dishes = valid_dishes[:limit]
+                    
+                    # Yield results in chunks of 4 at a time
+                    response_start_time = time.time()
+                    for i in range(0, len(limited_dishes), 4):
+                        chunk = limited_dishes[i:i + 4]
+                        yield f"data: {json.dumps(chunk)}\n\n"
+                        await asyncio.sleep(0.05)
+                    response_end_time = time.time()
+                    print(f"[TIME] Response Streaming Time (Chunk): {response_end_time - response_start_time:.2f} seconds")
+            
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
 
-                print(f"DEBUG: Extracted {len(chunk_dishes)} dishes from chunk {i//chunk_size + 1}.")
-            except json.JSONDecodeError:
-                print(f"DEBUG: JSON parsing error for chunk {i//chunk_size + 1}. Skipping.")
-                continue
-
-        extracted_dishes = list(extracted_dishes.values())
-        print(f"DEBUG: Total extracted unique dishes across all chunks: {len(extracted_dishes)}")
-
-        if not extracted_dishes:
-            print("DEBUG: Final aggregated array is empty.")
-            return {"error": "No dishes identified by LLM across all chunks"}
-
-        # 3️⃣ Validate against real menu FIRST
-        valid_dishes = []
-
-        with engine.connect() as connection:
-            for dish in extracted_dishes:
-                # Pre-process the dish name for wider matching (e.g., Mutton Maasala -> %mutton%masala%)
-                name_words = dish["name"].split()
-                if len(name_words) == 1:
-                    like_pattern = f"%{name_words[0]}%"
-                else:
-                    # e.g., "Mutton Maasala" -> "%mutton%masala%" but handle max 2 words for safe matching
-                    like_pattern = f"%{name_words[0]}%{name_words[-1]}%"
-
-                query = text("""
-                    SELECT 
-                        m.id,
-                        m.name AS item_name,
-                        c.name AS item_category,
-                        m.price AS item_price,
-                        NULL AS item_rating,
-                        NULL AS item_taste,
-                        NULL AS item_special
-                    FROM menu_items m
-                    LEFT JOIN menu_categories c ON m.category_id = c.id
-                    WHERE LOWER(m.name) LIKE LOWER(:dish_name_pattern)
-                    LIMIT 1
-                """)
-
-                result = connection.execute(
-                    query,
-                    {"dish_name_pattern": like_pattern}
-                ).fetchone()
-
-                if result:
-                    print(f"DEBUG: Matched dish '{dish['name']}' in DB: {result}")
-                    valid_dishes.append({
-                        "dish_name": result[1],
-                        "category": result[2],
-                        "price": result[3],
-                        "rating": result[4],
-                        "taste": result[5],
-                        "special": result[6],
-                        "sentiment_score": dish.get("sentiment_score", 0),
-                        "positive_mentions": dish.get("positive_mentions", 0),
-                        "negative_mentions": dish.get("negative_mentions", 0)
-                    })
-                else:
-                    print(f"DEBUG: Failed to match dish '{dish['name']}' to any menu item.")
-
-        if not valid_dishes:
-            return {"error": "No valid menu items matched"}
-
-        # 4️⃣ Keep only positive dishes
-        positive_dishes = [
-            dish for dish in valid_dishes
-            if dish["sentiment_score"] > 0
-            and dish["positive_mentions"] > dish["negative_mentions"]
-        ]
-
-        if not positive_dishes:
-            return {"error": "No positive dishes found"}
-
-        # 5️⃣ Sort by strongest positivity
-        positive_dishes = sorted(
-            positive_dishes,
-            key=lambda x: (x["sentiment_score"], x["positive_mentions"]),
-            reverse=True
-        )
-
-        # 6️⃣ Return top N
-        return {
-            "total_reviews_analyzed": len(review_results),
-            "top_positive_recommendations": positive_dishes[:limit]
-        }
+        processing_end_time = time.time()
+        print(f"[TIME] Total Data Processing & LLM Time: {processing_end_time - processing_start_time:.2f} seconds")
+        print(f"[TIME] Total Execution Time: {time.time() - total_start_time:.2f} seconds")
 
     except Exception as e:
-        return {"error": str(e)}
+        import traceback
+        traceback.print_exc()
+        yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"

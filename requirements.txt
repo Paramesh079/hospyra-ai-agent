@@ -80,3 +80,5 @@ uvicorn
 
 # Utilities
 python-dotenv
+
+langchain_openai

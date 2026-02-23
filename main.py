@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from sql_agent import query_menu, semantic_search_similar_items
 from review_analyzer import analyze_reviews_with_agent
 
@@ -11,31 +12,16 @@ async def run_query(prompt: str):
         "result": semantic_search_similar_items(prompt)
     }
     
-@app.get("/reviews-recommendations",tags=["ai-menu"])
+@app.get("/reviews-recommendations", tags=["ai-menu"])
 async def get_agent_recommendations(limit: int = 20):
     """
-    LLM-Based Positive Dish Recommendation
-
-    Flow:
-    - Reviews from PostgreSQL
-    - LLM extracts dishes + sentiment
-    - Validate against real menu
-    - Keep only positive dishes
-    - Sort by strongest positivity
-    - Return top N
+    LLM-Based Positive Dish Recommendation (Streaming)
     """
-
-    result = await analyze_reviews_with_agent(limit=limit)
-
-    if "error" in result:
-        raise HTTPException(status_code=500, detail=result["error"])
-
-    return {
-        "analysis_type": "LLM + DB Validated Positive Ranking",
-        "total_reviews_analyzed": result["total_reviews_analyzed"],
-        "recommendations_count": len(result["top_positive_recommendations"]),
-        "recommendations": result["top_positive_recommendations"]
-    }
+    # Return a StreamingResponse using Server-Sent Events (SSE)
+    return StreamingResponse(
+        analyze_reviews_with_agent(limit=limit),
+        media_type="text/event-stream"
+    )
 
 
 @app.get("/health",tags=["ai-menu"])
