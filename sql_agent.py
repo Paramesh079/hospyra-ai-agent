@@ -40,6 +40,48 @@ def query_menu(user_prompt: str, hotel_id: int):
     """
     print(f"\n[LOG] query_menu() called with prompt: {user_prompt}, hotel_id: {hotel_id}")
     
+    # Bypass LLM if the prompt is purely a numeric user ID
+    if user_prompt.strip().isdigit():
+        user_id = int(user_prompt.strip())
+        print(f"[LOG] Bypassing LLM for numeric user ID: {user_id}")
+        sql_query = f"""
+        WITH user_history AS (
+            SELECT mi.id, mi.name, mi.is_vegetarian
+            FROM order_items oi
+            JOIN orders o ON oi.order_id = o.id
+            JOIN menu_items mi ON oi.menu_item_id = mi.id
+            WHERE o.user_id = {user_id} AND o.hotel_id = {hotel_id}
+        )
+        SELECT mi.id, mi.name, mc.name as category, mi.price
+        FROM menu_items mi
+        JOIN menu_categories mc ON mi.category_id = mc.id
+        JOIN menus mn ON mc.menu_id = mn.id
+        JOIN user_history uh ON mi.is_vegetarian = uh.is_vegetarian
+        WHERE mi.is_available = true AND mn.hotel_id = {hotel_id}
+        GROUP BY mi.name, mc.name, mi.price, mi.id
+        ORDER BY 
+          MAX(CASE WHEN mi.id IN (SELECT id FROM user_history) THEN 1 ELSE 0 END) DESC, -- LAYER 1
+          MAX(CASE WHEN EXISTS (
+              SELECT 1 FROM user_history uh2 
+              WHERE mi.name ILIKE '%' || uh2.name || '%' 
+              OR uh2.name ILIKE '%' || mi.name || '%'
+          ) THEN 1 ELSE 0 END) DESC, -- LAYER 2 (LAST LAYER)
+          mi.name
+        LIMIT 100;
+        """
+        try:
+            print(f"[LOG] Executing Direct SQL Query for User ID: {user_id}")
+            with engine.connect() as connection:
+                result = connection.execute(text(sql_query))
+                results = [dict(row) for row in result.mappings()]
+            print(f"[LOG] Found {len(results)} results")
+            return results
+        except Exception as e:
+            print(f"[ERROR] An error occurred: {e}")
+            import traceback
+            print(f"[ERROR] Traceback: {traceback.format_exc()}")
+            return {"error": "Internal Server Error", "details": str(e)}
+    
     system_prompt = f"""
                   You are a PostgreSQL Query Generator for a restaurant ordering system.
 
@@ -121,7 +163,7 @@ def query_menu(user_prompt: str, hotel_id: int):
                         JOIN menu_items mi ON oi.menu_item_id = mi.id
                         WHERE o.user_id = 21 AND o.hotel_id = {hotel_id}
                     )
-                    SELECT mi.name, mc.name as category, mi.price
+                    SELECT mi.id, mi.name, mc.name as category, mi.price
                     FROM menu_items mi
                     JOIN menu_categories mc ON mi.category_id = mc.id
                     JOIN menus mn ON mc.menu_id = mn.id
@@ -142,7 +184,7 @@ def query_menu(user_prompt: str, hotel_id: int):
                   - Query for Global Name Matches (Layer 2 focus):
                     ```sql
                     WITH history AS (SELECT DISTINCT name, is_vegetarian FROM menu_items WHERE id IN (SELECT menu_item_id FROM order_items oi JOIN orders o ON oi.order_id = o.id WHERE o.user_id = 7 AND o.hotel_id = {hotel_id}))
-                    SELECT mi.name, mc.name as category, mi.price
+                    SELECT mi.id, mi.name, mc.name as category, mi.price
                     FROM menu_items mi
                     JOIN menu_categories mc ON mi.category_id = mc.id
                     JOIN menus mn ON mc.menu_id = mn.id
@@ -162,11 +204,12 @@ def query_menu(user_prompt: str, hotel_id: int):
                   6. **NEVER USE SELECT DISTINCT** in recommendation queries (it conflicts with ranking). Use **GROUP BY** instead.
                   7. When ranking by non-selected expressions, use aggregate functions like `MAX()` in the ORDER BY clause.
                   8. Strictly follow the dietary preference (`is_vegetarian`) of the user's previous orders.
+                  9. ALWAYS include `mi.id` in the SELECT clause.
 
 
                   Example search: "cheese pizza"
                   ```sql
-                  SELECT mi.name, mc.name as category, mi.price 
+                  SELECT mi.id, mi.name, mc.name as category, mi.price 
                   FROM menu_items mi 
                   JOIN menu_categories mc ON mi.category_id = mc.id
                   JOIN menus mn ON mc.menu_id = mn.id

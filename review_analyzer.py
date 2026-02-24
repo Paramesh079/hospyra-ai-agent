@@ -44,7 +44,6 @@ async def analyze_reviews_with_agent(hotel_id: int, limit: int = 20):
                 FROM reviews
                 WHERE comment IS NOT NULL AND hotel_id = :hotel_id
                 ORDER BY id DESC
-                LIMIT 200
             """)
             review_results = connection.execute(review_query, {"hotel_id": hotel_id}).fetchall()
 
@@ -60,7 +59,9 @@ You are a Restaurant Review Analysis Agent.
 Task:
 1. Identify ALL dishes mentioned.
 2. Determine sentiment for EACH dish.
-3. Count positive and negative mentions.
+3. Count positive, negative, and neutral mentions.
+4. Extract top keywords (e.g., "spicy", "cold", "perfect") and taste descriptors.
+5. Provide a short summary of what people are saying about the dish.
 
 Return ONLY valid JSON:
 
@@ -70,7 +71,11 @@ Return ONLY valid JSON:
       "name": "Dish Name",
       "positive_mentions": 2,
       "negative_mentions": 0,
-      "sentiment_score": 0.85
+      "neutral_mentions": 1,
+      "sentiment_score": 0.85,
+      "top_keywords": ["crispy", "fresh"],
+      "taste_descriptors": ["salty", "rich"],
+      "summary": "People loved the crispy texture but a few found it slightly too salty."
     }
   ]
 }
@@ -105,7 +110,7 @@ Return ONLY valid JSON:
         processing_start_time = time.time()
         tasks = [llm.ainvoke(prompt) for prompt in prompts]
         completed_count = 0
-        all_valid_dishes = []
+        aggregated_dishes = {}
         
         for task in asyncio.as_completed(tasks):
             try:
@@ -119,12 +124,8 @@ Return ONLY valid JSON:
                 agent_analysis = json.loads(json_match.group())
                 chunk_dishes = agent_analysis.get("dishes", [])
                 
-                valid_dishes = []
                 for dish in chunk_dishes:
-                    if dish.get("sentiment_score", 0) <= 0 or dish.get("positive_mentions", 0) <= dish.get("negative_mentions", 0):
-                        continue # Skip non-positive right away
-                        
-                    dish_name_lower = dish["name"].lower()
+                    dish_name_lower = dish.get("name", "").lower()
                     if not dish_name_lower:
                         continue
                         
@@ -144,30 +145,117 @@ Return ONLY valid JSON:
                                 break
                     
                     if best_match:
-                        valid_dishes.append({
-                            "id": best_match[0],
-                            "dish_name": best_match[1],
-                            "category": best_match[2],
-                            "price": float(best_match[3]) if isinstance(best_match[3], Decimal) else best_match[3],
-                            "sentiment_score": dish.get("sentiment_score", 0),
-                            "positive_mentions": dish.get("positive_mentions", 0),
-                            "negative_mentions": dish.get("negative_mentions", 0)
-                        })
-                
-                if valid_dishes:
-                    # Append items to the master list
-                    for dish in valid_dishes:
-                        if dish["id"] not in [d["id"] for d in all_valid_dishes]:
-                            all_valid_dishes.append(dish)
+                        item_id = best_match[0]
+                        if item_id not in aggregated_dishes:
+                            aggregated_dishes[item_id] = {
+                                "id": item_id,
+                                "dish_name": best_match[1],
+                                "category": best_match[2],
+                                "price": float(best_match[3]) if isinstance(best_match[3], Decimal) else best_match[3],
+                                "sentiment_score": 0.0,
+                                "positive_mentions": 0,
+                                "negative_mentions": 0,
+                                "neutral_mentions": 0,
+                                "top_keywords": [],
+                                "taste_descriptors": [],
+                                "summary_parts": [],
+                                "occurrence_count": 0
+                            }
+                        
+                        ad = aggregated_dishes[item_id]
+                        ad["positive_mentions"] += dish.get("positive_mentions", 0)
+                        ad["negative_mentions"] += dish.get("negative_mentions", 0)
+                        ad["neutral_mentions"] += dish.get("neutral_mentions", 0)
+                        ad["sentiment_score"] += dish.get("sentiment_score", 0)
+                        ad["occurrence_count"] += 1
+                        
+                        if dish.get("top_keywords"):
+                            ad["top_keywords"].extend(dish.get("top_keywords"))
+                        if dish.get("taste_descriptors"):
+                            ad["taste_descriptors"].extend(dish.get("taste_descriptors"))
+                        if dish.get("summary"):
+                            ad["summary_parts"].append(dish.get("summary"))
             
             except Exception as e:
                 import traceback
                 traceback.print_exc()
 
-        # Sort combined dishes at the end
+        # Process aggregated data and upsert to database
+        print(f"[LOG] Total reviews processed: {len(review_results)}")
+        
+        all_valid_dishes = []
+        for item_id, ad in aggregated_dishes.items():
+            if ad["occurrence_count"] > 0:
+                ad["sentiment_score"] = ad["sentiment_score"] / ad["occurrence_count"]
+            
+            total_mentions = ad["positive_mentions"] + ad["negative_mentions"] + ad["neutral_mentions"]
+            ad["mention_count"] = total_mentions
+            ad["popularity_score"] = min(total_mentions * 5.0, 100.0)
+            if total_mentions > 0:
+                ad["hype_score"] = ((ad["positive_mentions"] - ad["negative_mentions"]) / total_mentions) * 100.0
+            else:
+                ad["hype_score"] = 0.0
+            ad["confidence_score"] = min(total_mentions * 10.0, 100.0)
+            ad["final_summary"] = " ".join(ad["summary_parts"])[:500]
+            
+            ad["top_keywords"] = list(set(ad["top_keywords"]))[:10]
+            ad["taste_descriptors"] = list(set(ad["taste_descriptors"]))[:10]
+            
+            all_valid_dishes.append(ad)
+
         if all_valid_dishes:
-            all_valid_dishes.sort(key=lambda x: (x.get("sentiment_score", 0), x.get("positive_mentions", 0)), reverse=True)
-            limited_dishes = all_valid_dishes[:limit]
+            with engine.begin() as connection:
+                for ad in all_valid_dishes:
+                    upsert_query = text("""
+                        INSERT INTO dish_review_analytics (
+                            menu_item_id, hotel_id, mention_count, positive_mentions, 
+                            negative_mentions, neutral_mentions, sentiment_score, 
+                            popularity_score, hype_score, confidence_score, 
+                            llm_summary, top_keywords, taste_descriptors, processed_review_count,
+                            last_processed_at
+                        ) VALUES (
+                            :menu_item_id, :hotel_id, :mention_count, :positive_mentions,
+                            :negative_mentions, :neutral_mentions, :sentiment_score,
+                            :popularity_score, :hype_score, :confidence_score,
+                            :llm_summary, :top_keywords, :taste_descriptors, :processed_review_count,
+                            CURRENT_TIMESTAMP
+                        ) ON CONFLICT (menu_item_id) DO UPDATE SET
+                            mention_count = EXCLUDED.mention_count,
+                            positive_mentions = EXCLUDED.positive_mentions,
+                            negative_mentions = EXCLUDED.negative_mentions,
+                            neutral_mentions = EXCLUDED.neutral_mentions,
+                            sentiment_score = EXCLUDED.sentiment_score,
+                            popularity_score = EXCLUDED.popularity_score,
+                            hype_score = EXCLUDED.hype_score,
+                            confidence_score = EXCLUDED.confidence_score,
+                            llm_summary = EXCLUDED.llm_summary,
+                            top_keywords = EXCLUDED.top_keywords,
+                            taste_descriptors = EXCLUDED.taste_descriptors,
+                            processed_review_count = EXCLUDED.processed_review_count,
+                            last_processed_at = CURRENT_TIMESTAMP,
+                            updated_at = CURRENT_TIMESTAMP
+                    """)
+                    connection.execute(upsert_query, {
+                        "menu_item_id": ad["id"],
+                        "hotel_id": hotel_id,
+                        "mention_count": ad["mention_count"],
+                        "positive_mentions": ad["positive_mentions"],
+                        "negative_mentions": ad["negative_mentions"],
+                        "neutral_mentions": ad["neutral_mentions"],
+                        "sentiment_score": ad["sentiment_score"],
+                        "popularity_score": ad["popularity_score"],
+                        "hype_score": ad["hype_score"],
+                        "confidence_score": ad["confidence_score"],
+                        "llm_summary": ad["final_summary"],
+                        "top_keywords": json.dumps(ad["top_keywords"]),
+                        "taste_descriptors": json.dumps(ad["taste_descriptors"]),
+                        "processed_review_count": len(review_results)
+                    })
+
+            # Sort combined dishes for recommendations stream (only positive ones)
+            positive_dishes = [d for d in all_valid_dishes if d["sentiment_score"] > 0 and d["positive_mentions"] > d["negative_mentions"]]
+            positive_dishes.sort(key=lambda x: (x.get("sentiment_score", 0), x.get("positive_mentions", 0)), reverse=True)
+            limited_dishes = positive_dishes[:limit]
             
             formatted_chunk = [{"id": item["id"]} for item in limited_dishes]
             yield f"data: {json.dumps(formatted_chunk)}\n\n"
