@@ -1,0 +1,10 @@
+menu,menu_category,item_name,price,is_vegetarian
+BREAKFAST,Breakfast,Hawaiian Breakfast,$10,True
+BREAKFAST,Breakfast,Bacon and Egg Breakfast,$10,False
+BREAKFAST,Breakfast,Ham and Cheese Breakfast,$10,False
+LUNCH,Lunch,Spicy Thai Chicken Lunch,$10,False
+LUNCH,Lunch,Sweet and Sour Beef Soup Lunch,$10,False
+LUNCH,Lunch,Beef Stew Lunch,$10,False
+DINNER,Dinner,Spicy Thai Chicken Dinner,$10,False
+DINNER,Dinner,Sweet and Sour Beef Soup Dinner,$10,False
+DINNER,Dinner,Beef Stew Dinner,$10,False

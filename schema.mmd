@@ -1,0 +1,307 @@
+
+erDiagram
+    restaurants ||--o{ menus : "has"
+    restaurants ||--o{ orders : "has"
+    restaurants ||--o{ table_groups : "has"
+    restaurants ||--o{ staff : "has"
+    restaurants ||--o{ inventory_transactions : "has"
+    restaurants ||--o{ stock_audits : "has"
+    restaurants ||--o{ reviews : "has"
+    restaurants ||--o{ dish_review_analytics : "has"
+    restaurants ||--o{ ingredients : "has"
+    restaurants ||--o{ restaurant_layouts : "has"
+
+    users ||--o{ restaurants : "owns"
+    users ||--o{ staff : "is"
+    users ||--o{ orders : "places"
+    users ||--o{ inventory_transactions : "performs"
+    users ||--o{ user_permissions : "has"
+
+    menus ||--o{ menu_categories : "contains"
+    
+    menu_categories ||--o{ menu_items : "contains"
+    
+    menu_items ||--o{ order_items : "included_in"
+    menu_items ||--o{ recipe_ingredients : "uses"
+    menu_items ||--o{ dish_review_analytics : "analyzed_in"
+    
+    orders ||--o{ order_items : "contains"
+    orders ||--o{ payments : "paid_via"
+
+    ingredients ||--o{ recipe_ingredients : "used_in"
+    ingredients ||--o{ inventory_transactions : "tracked_in"
+    ingredients ||--o{ stock_audit_items : "audited_in"
+
+    stock_audits ||--o{ stock_audit_items : "contains"
+    
+    table_groups ||--o{ dining_tables : "contains"
+
+    restaurants {
+        INTEGER id PK
+        INTEGER owner_id FK
+        VARCHAR name
+        VARCHAR address
+        VARCHAR phone
+        VARCHAR email
+        TEXT description
+        VARCHAR logo_url
+        JSONB settings
+        TIMESTAMP created_at
+        TIMESTAMP updated_at
+        VARCHAR(100) status
+        VARCHAR currency
+        VARCHAR timezone
+    }
+
+    menus {
+        INTEGER id PK
+        INTEGER hotel_id FK
+        VARCHAR name
+        TEXT description
+        BOOLEAN is_active
+        TIMESTAMP created_at
+        TIMESTAMP updated_at
+    }
+
+    menu_categories {
+        INTEGER id PK
+        INTEGER menu_id FK
+        VARCHAR name
+        TEXT description
+        INTEGER priority
+        BOOLEAN is_active
+        TIMESTAMP created_at
+        TIMESTAMP updated_at
+    }
+
+    menu_items {
+        INTEGER id PK
+        INTEGER category_id FK
+        VARCHAR name
+        TEXT description
+        NUMERIC price
+        VARCHAR image_url
+        BOOLEAN is_available
+        BOOLEAN is_vegetarian
+        BOOLEAN is_vegan
+        BOOLEAN is_jain
+        BOOLEAN is_bestseller
+        INTEGER spice_level
+        INTEGER preparation_time
+        JSONB allergens
+        JSONB tags
+        BOOLEAN is_active
+        TIMESTAMP created_at
+        TIMESTAMP updated_at
+        INTEGER calories
+        VARCHAR portion_size
+        NUMERIC margin
+    }
+
+    dining_tables {
+        INTEGER id PK
+        INTEGER group_id FK
+        VARCHAR number
+        INTEGER capacity
+        VARCHAR status
+        VARCHAR qr_code_url
+        TIMESTAMP created_at
+        TIMESTAMP updated_at
+        INTEGER current_order_id
+        TIMESTAMP last_status_change
+    }
+
+    orders {
+        INTEGER id PK
+        INTEGER hotel_id FK
+        INTEGER table_id
+        INTEGER user_id FK
+        VARCHAR status
+        NUMERIC total_amount
+        VARCHAR special_instructions
+        TIMESTAMP created_at
+        TIMESTAMP updated_at
+        VARCHAR order_type
+        INTEGER guest_count
+        NUMERIC discount_amount
+        NUMERIC tax_amount
+    }
+
+    order_items {
+        INTEGER id PK
+        INTEGER order_id FK
+        INTEGER menu_item_id FK
+        INTEGER quantity
+        NUMERIC price
+        VARCHAR special_instructions
+        VARCHAR status
+        TIMESTAMP created_at
+        TIMESTAMP updated_at
+        JSONB customizations
+    }
+
+    users {
+        INTEGER id PK
+        VARCHAR name
+        VARCHAR email
+        VARCHAR password_hash
+        VARCHAR role
+        VARCHAR phone
+        BOOLEAN is_active
+        TIMESTAMP created_at
+        TIMESTAMP updated_at
+        TIMESTAMP last_login
+        VARCHAR auth_provider
+        VARCHAR reset_token
+    }
+
+    payments {
+        INTEGER id PK
+        INTEGER order_id FK
+        NUMERIC amount
+        VARCHAR payment_method
+        VARCHAR status
+        VARCHAR transaction_id
+        TIMESTAMP created_at
+        TIMESTAMP updated_at
+    }
+
+    staff {
+        INTEGER id PK
+        INTEGER hotel_id FK
+        INTEGER user_id FK
+        VARCHAR role
+        VARCHAR employee_id
+        INTEGER shift_start
+        INTEGER shift_end
+        TIMESTAMP created_at
+        TIMESTAMP updated_at
+        VARCHAR status
+        NUMERIC hourly_rate
+    }
+
+    table_groups {
+        INTEGER id PK
+        INTEGER hotel_id FK
+        VARCHAR name
+        VARCHAR description
+        BOOLEAN is_active
+        TIMESTAMP created_at
+        TIMESTAMP updated_at
+    }
+
+    recipe_ingredients {
+        INTEGER id PK
+        INTEGER menu_item_id FK
+        INTEGER ingredient_id FK
+        NUMERIC quantity
+        VARCHAR unit
+        BOOLEAN is_optional
+        TEXT notes
+    }
+
+    inventory_transactions {
+        INTEGER id PK
+        INTEGER hotel_id FK
+        INTEGER ingredient_id FK
+        VARCHAR transaction_type
+        NUMERIC quantity
+        VARCHAR unit
+        VARCHAR reference_type
+        INTEGER reference_id
+        VARCHAR batch_number
+        TIMESTAMP expiry_date
+        NUMERIC cost_per_unit
+        NUMERIC total_value
+        INTEGER performed_by FK
+        TIMESTAMP created_at
+    }
+
+    user_permissions {
+        INTEGER id PK
+        INTEGER user_id FK
+        VARCHAR permission
+        VARCHAR effect
+        VARCHAR scope_type
+        INTEGER scope_id
+        TIMESTAMP created_at
+        TIMESTAMP updated_at
+    }
+
+    stock_audit_items {
+        INTEGER id PK
+        INTEGER audit_id FK
+        INTEGER ingredient_id FK
+        NUMERIC system_qty
+        NUMERIC physical_qty
+        NUMERIC variance
+        NUMERIC cost_impact
+    }
+
+    stock_audits {
+        INTEGER id PK
+        INTEGER hotel_id FK
+        TEXT status
+        TEXT notes
+        TIMESTAMP started_at
+        TIMESTAMP completed_at
+        INTEGER performed_by
+    }
+
+    reviews {
+        INTEGER id PK
+        INTEGER hotel_id FK
+        INTEGER rating
+        TEXT comment
+        TIMESTAMP created_at
+        TIMESTAMP updated_at
+        VARCHAR author_name
+        TIMESTAMP review_date
+        VARCHAR source
+    }
+
+    dish_review_analytics {
+        INTEGER id PK
+        INTEGER menu_item_id FK
+        INTEGER hotel_id FK
+        INTEGER mention_count
+        INTEGER positive_mentions
+        INTEGER negative_mentions
+        INTEGER neutral_mentions
+        DOUBLE sentiment_score
+        DOUBLE popularity_score
+        DOUBLE hype_score
+        DOUBLE confidence_score
+        TEXT llm_summary
+        JSONB top_keywords
+        JSONB taste_descriptors
+        INTEGER processed_review_count
+        VARCHAR model_version
+        TIMESTAMP last_processed_at
+        TIMESTAMP created_at
+        TIMESTAMP updated_at
+    }
+
+    ingredients {
+        INTEGER id PK
+        INTEGER hotel_id FK
+        VARCHAR name
+        VARCHAR category
+        VARCHAR base_unit
+        VARCHAR storage_type
+        NUMERIC cost_price
+        NUMERIC current_stock
+        NUMERIC reorder_level
+        BOOLEAN is_active
+        TIMESTAMP created_at
+        TIMESTAMP updated_at
+    }
+
+    restaurant_layouts {
+        INTEGER id PK
+        INTEGER hotel_id FK
+        VARCHAR layout_name
+        JSONB layout_data
+        TIMESTAMP created_at
+        TIMESTAMP updated_at
+    }

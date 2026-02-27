@@ -4,10 +4,21 @@ import csv
 import argparse
 import sys
 import base64
-import requests
+from dotenv import load_dotenv
+from openai import AzureOpenAI
 from datetime import datetime, timezone
 from sqlalchemy import text
 from db import engine
+
+load_dotenv()
+
+# Azure OpenAI credentials (same .env as sql_agent.py)
+_azure_client = AzureOpenAI(
+    api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+    azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+    api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2025-01-01-preview"),
+)
+_azure_deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "Hospyra")
 
 def encode_image(image_path):
     """
@@ -17,25 +28,39 @@ def encode_image(image_path):
         with open(image_path, "rb") as image_file:
             return base64.b64encode(image_file.read()).decode('utf-8')
     except FileNotFoundError:
-        print(f"Error: Could not find image at {image_path}")
-        sys.exit(1)
+        raise FileNotFoundError(f"Error: Could not find image at {image_path}")
 
-def analyze_menu_image_local(image_path, model_name, api_url):
+def analyze_menu_image_local(image_path, model_name=None, api_url=None):
     """
-    Calls a local LLM through an Ollama-compatible API to extract structured menu data.
+    Calls Azure OpenAI vision deployment to extract structured menu data from an image.
+    model_name and api_url are accepted for API compatibility but ignored (Azure config comes from .env).
     """
     print(f"Reading image: {image_path}")
     base64_image = encode_image(image_path)
 
+    # Detect image mime type from extension
+    ext = os.path.splitext(image_path)[-1].lower()
+    mime_map = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}
+    mime_type = mime_map.get(ext, "image/jpeg")
+
     prompt_text = (
         "You are an expert data extractor. Analyze this restaurant menu image "
-        "and extract all the food items strictly into a JSON array. "
+        "and extract ALL items — including food, drinks, beverages, desserts, and any other listed items — strictly into a JSON array. "
+        "Do NOT skip any section. Every item visible on the image must be included. "
         "Each object in the array MUST have the exact following keys:\n"
-        "- 'menu': The main section heading (e.g., 'SOUPS').\n"
-        "- 'menu_category': The sub-category under the main section (e.g., 'Western', 'Mexican', 'Pan Asian').\n"
-        "- 'item_name': The exact name of the dish.\n"
-        "- 'price': The price of the dish as a string (e.g. '199/-', '299/-').\n"
-        "- 'is_vegetarian': true if vegetarian (green symbol or Veg label), false if non-vegetarian (red symbol or Non-Veg label).\n\n"
+        "- 'menu': The main section heading exactly as printed on the image (e.g., 'SOUPS', 'BEVERAGES', 'DESSERTS').\n"
+        "- 'menu_category': Follow this priority order:\n"
+        "  1. If a sub-category label is EXPLICITLY printed on the image (e.g., 'Western', 'Pan Asian'), use that exact text.\n"
+        "  2. If NO sub-category label is visible, assign a category based on EACH ITEM'S OWN nature:\n"
+        "     - Use 'Beverages' if the item is a drink (juice, water, soda, tea, coffee, mocktail, cocktail, milkshake, lassi, etc.).\n"
+        "     - Use 'Non-Veg' if the item is a food that contains or is named after meat, poultry (chicken, mutton, lamb, beef, pork), seafood, or eggs.\n"
+        "     - Use 'Veg' if the item is a food that contains no meat, poultry, seafood, or eggs.\n"
+        "     - Every item must independently get its own category — do NOT group all items under a single category.\n"
+        "     - Never use cuisine names (like 'Indian', 'Chinese') unless they are explicitly printed on the image.\n"
+        "- 'item_name': The exact name of the item as printed.\n"
+        "- 'price': The price of the item as a string (e.g. '199/-', '299/-').\n"
+        "- 'is_vegetarian': true if vegetarian (green symbol or Veg label), false if non-vegetarian (red symbol or Non-Veg label). "
+        "For beverages and desserts with no symbol, set true by default.\n\n"
         "IMPORTANT RULES FOR VEG/NON-VEG:\n"
         "1. If an item indicates BOTH Veg and Non-Veg options (e.g., it has both a green and red symbol, or says 'Veg/Non-Veg', or has two prices separated by a slash like '299/349/-'), you MUST split it into TWO separate objects in the array.\n"
         "2. For the split items, append '(Veg)' or '(Non-Veg)' to the 'item_name' if not already present.\n"
@@ -45,50 +70,33 @@ def analyze_menu_image_local(image_path, model_name, api_url):
         "Output strictly valid JSON starting with [ and ending with ]."
     )
 
-    schema = {
-        "type": "array",
-        "items": {
-            "type": "object",
-            "properties": {
-                "menu": {"type": "string"},
-                "menu_category": {"type": "string"},
-                "item_name": {"type": "string"},
-                "price": {"type": "string"},
-                "is_vegetarian": {"type": "boolean"}
-            },
-            "required": ["menu", "menu_category", "item_name", "price", "is_vegetarian"]
-        }
-    }
 
-    # Standard payload for Ollama POST /api/chat
-    payload = {
-        "model": model_name,
-        "messages": [
+    print(f"Sending image to Azure OpenAI deployment '{_azure_deployment}'...")
+    response = _azure_client.chat.completions.create(
+        model=_azure_deployment,
+        messages=[
             {
                 "role": "user",
-                "content": prompt_text,
-                "images": [base64_image]
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{mime_type};base64,{base64_image}",
+                            "detail": "high"
+                        }
+                    },
+                    {
+                        "type": "text",
+                        "text": prompt_text
+                    }
+                ]
             }
         ],
-        "format": schema,
-        "stream": False,
-        "options": {
-            "temperature": 0.1
-        }
-    }
+        temperature=0.1,
+        max_tokens=8192,
+    )
+    return response.choices[0].message.content
 
-    print(f"Sending request to local model '{model_name}' at {api_url}...")
-    try:
-        response = requests.post(f"{api_url}/api/chat", json=payload)
-        response.raise_for_status()
-        
-        result = response.json()
-        return result.get('message', {}).get('content', '')
-        
-    except requests.exceptions.RequestException as e:
-        print(f"\nError connecting to local API: {e}")
-        print(f"Make sure your local model server is running at {api_url}")
-        sys.exit(1)
 
 def insert_menu_data_to_db(data, hotel_id, save_csv=None):
     """
@@ -105,8 +113,7 @@ def insert_menu_data_to_db(data, hotel_id, save_csv=None):
             ).fetchone()
             
             if not result:
-                print(f"Error: No restaurant found with ID {hotel_id}. Please use a valid ID or create the restaurant first.")
-                sys.exit(1)
+                raise ValueError(f"Error: No restaurant found with ID {hotel_id}. Please use a valid ID or create the restaurant first.")
                 
             hotel_name = result[1]
             print(f"Found restaurant: {hotel_name} (ID: {hotel_id})")
@@ -239,21 +246,19 @@ def insert_menu_data_to_db(data, hotel_id, save_csv=None):
                 print(f"Extraction results also saved to {save_csv}")
                 
     except Exception as e:
-        print(f"Database insertion failed: {e}")
-        sys.exit(1)
+        raise RuntimeError(f"Database insertion failed: {e}")
 
 def main():
-    parser = argparse.ArgumentParser(description="Extract menu from image and insert into PostgreSQL database.")
+    parser = argparse.ArgumentParser(description="Extract menu from image and insert into PostgreSQL database using Azure OpenAI.")
     parser.add_argument("image_path", nargs="?", default="/home/paramesh/Downloads/17_restaurant.jpg", help="Path to the menu image")
     parser.add_argument("--hotel-id", default=17, type=int, help="The ID of the restaurant (hotel) in the database")
     parser.add_argument("--out", default="extracted_menu.csv", help="Optional: output CSV filename to also save the extracted data (default: extracted_menu.csv)")
-    parser.add_argument("--model", default="qwen2.5vl:7b", help="Local Model ID to use (e.g., qwen2.5vl:7b)")
-    parser.add_argument("--api-url", default="http://localhost:11434", help="URL of the local inference server (default Ollama port)")
-    
+
     args = parser.parse_args()
-    
-    # 1. Analyze image
-    result_text = analyze_menu_image_local(args.image_path, args.model, args.api_url)
+
+    # 1. Analyze image via Azure OpenAI
+    result_text = analyze_menu_image_local(args.image_path)
+
     
     # 2. Clean the string to extract raw JSON
     clean_text = result_text.strip()
